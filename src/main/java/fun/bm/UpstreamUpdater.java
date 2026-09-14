@@ -140,7 +140,7 @@ public class UpstreamUpdater {
                 if (!addResult.isSuccess()) {
                     throw new IllegalStateException("Failed to add remote " + name + ": " + addResult.stderr());
                 }
-                Result fetchResult = tempGit.run("fetch", "--depth=1", name);
+                Result fetchResult = tempGit.run("fetch", name, "refs/heads/*:refs/remotes/" + name + "/*");
                 if (!fetchResult.isSuccess()) {
                     throw new IllegalStateException("Failed to fetch from " + upstreamUrls.get(i) + ": " + fetchResult.stderr());
                 }
