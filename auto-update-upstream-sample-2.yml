@@ -13,7 +13,7 @@ jobs:
       # 多个上游仓库地址，每行一个（第一个为主仓库，后续为备用镜像）
       UPSTREAM_URLS: |
         https://github.com/PaperMC/Folia.git
-        https://github.com/SomeMirror/Folia.git
+        https://github.com/LophineLabs/Folia.git
       REF: "foliaRef"
       TITLE: "Update Upstream (Folia)"
       REF_COMMIT: "auto-update/upstream"
@@ -28,19 +28,26 @@ jobs:
         working-directory: check
         run: |
           BRANCH=${{ env.REF_COMMIT }}
-          # 使用第一个上游仓库进行预检
-          PRIMARY_URL=$(echo "${{ env.UPSTREAM_URLS }}" | head -n 1 | tr -d '[:space:]')
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             git fetch origin "$BRANCH"
             LOCAL_REF=$(git show "origin/$BRANCH:gradle.properties" | grep '^${{ env.REF }}=' | cut -d'=' -f2 | tr -d '[:space:]')
           else
             LOCAL_REF=$(grep '^${{ env.REF }}=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
           fi
-          UPSTREAM_REF=$(git ls-remote "$PRIMARY_URL" HEAD | cut -f1)
           echo "Local ref: $LOCAL_REF"
-          echo "Upstream ref: $UPSTREAM_REF"
-          if [ "$LOCAL_REF" = "$UPSTREAM_REF" ]; then
-            echo "Upstream is already up to date, skipping all steps."
+          # 遍历所有上游仓库，任一有更新则不跳过
+          SKIP=true
+          while IFS= read -r url; do
+            url=$(echo "$url" | tr -d '[:space:]')
+            if [ -z "$url" ]; then continue; fi
+            UPSTREAM_REF=$(git ls-remote "$url" HEAD | cut -f1)
+            echo "Upstream [$url] ref: $UPSTREAM_REF"
+            if [ "$LOCAL_REF" != "$UPSTREAM_REF" ]; then
+              SKIP=false
+            fi
+          done <<< "${{ env.UPSTREAM_URLS }}"
+          if [ "$SKIP" = "true" ]; then
+            echo "All upstreams are up to date, skipping all steps."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
