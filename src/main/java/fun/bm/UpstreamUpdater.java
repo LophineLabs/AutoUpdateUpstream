@@ -7,12 +7,8 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
+import java.nio.file.Path;
+import java.util.*;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -20,12 +16,12 @@ import java.util.regex.Pattern;
 public class UpstreamUpdater {
     private static final Logger LOGGER = Logger.getLogger("AutoUpdate-Updater");
 
-    public record LatestCommit(String sha, String branch) {
+    public record UpstreamCommit(String sha, String branch, String url) {
     }
 
     private final File repoDir;
     private final String propertyKey;
-    private final String upstreamUrl;
+    private final List<String> upstreamUrls;
     private final String upstreamBranch;
     private final String applyTask;
     private final String buildTask;
@@ -33,12 +29,12 @@ public class UpstreamUpdater {
     private final String fixTask;
     private final GitExecutor git = new GitExecutor();
 
-    public UpstreamUpdater(File repoDir, String propertyKey, String upstreamUrl,
+    public UpstreamUpdater(File repoDir, String propertyKey, List<String> upstreamUrls,
                            String upstreamBranch, String applyTask, String buildTask,
                            Set<String> rebuildTasks, String fixTask) {
         this.repoDir = repoDir;
         this.propertyKey = propertyKey;
-        this.upstreamUrl = upstreamUrl;
+        this.upstreamUrls = upstreamUrls;
         this.upstreamBranch = upstreamBranch;
         this.applyTask = applyTask;
         this.buildTask = buildTask;
@@ -55,8 +51,8 @@ public class UpstreamUpdater {
         String currentRef = readCurrentRef(propertiesFile);
         LOGGER.info("Current " + propertyKey + ": " + currentRef);
 
-        LatestCommit latest = resolveLatestCommit();
-        LOGGER.info("Latest upstream commit: " + latest.sha() + " (" + upstreamUrl + " @ " + latest.branch() + ")");
+        UpstreamCommit latest = resolveLatestCommit();
+        LOGGER.info("Latest upstream commit: " + latest.sha() + " (" + latest.url() + " @ " + latest.branch() + ")");
 
         if (latest.sha().equalsIgnoreCase(currentRef)) {
             LOGGER.info("Already up to date, no changes made.");
@@ -112,9 +108,64 @@ public class UpstreamUpdater {
         return matcher.group(1);
     }
 
-    private LatestCommit resolveLatestCommit() throws IOException, InterruptedException {
+    private UpstreamCommit resolveLatestCommit() throws IOException, InterruptedException {
+        // 依次查询每个上游的最新提交，按优先级（列表顺序）从高到低处理
+        List<UpstreamCommit> commits = new ArrayList<>();
+        for (String url : upstreamUrls) {
+            UpstreamCommit commit = queryUpstreamCommit(url);
+            commits.add(commit);
+            LOGGER.info("Upstream [" + url + "] latest commit: " + commit.sha() + " @ " + commit.branch());
+        }
+
+        // 只有一个上游时直接返回
+        if (commits.size() == 1) {
+            return commits.get(0);
+        }
+
+        // 多个上游时，创建临时仓库 fetch 所有上游后在本地比较提交新旧
+        Path tempDir = Files.createTempDirectory("upstream-compare-");
+        try {
+            File tempRepo = tempDir.toFile();
+            GitExecutor tempGit = new GitExecutor(tempRepo);
+
+            Result initResult = tempGit.run("init");
+            if (!initResult.isSuccess()) {
+                throw new IllegalStateException("Failed to init temp repo for comparison: " + initResult.stderr());
+            }
+
+            // 为每个上游添加 remote 并 fetch
+            for (int i = 0; i < upstreamUrls.size(); i++) {
+                String name = "upstream" + i;
+                Result addResult = tempGit.run("remote", "add", name, upstreamUrls.get(i));
+                if (!addResult.isSuccess()) {
+                    throw new IllegalStateException("Failed to add remote " + name + ": " + addResult.stderr());
+                }
+                Result fetchResult = tempGit.run("fetch", "--depth=1", name);
+                if (!fetchResult.isSuccess()) {
+                    throw new IllegalStateException("Failed to fetch from " + upstreamUrls.get(i) + ": " + fetchResult.stderr());
+                }
+            }
+
+            // 主上游优先；依次检查每个备用上游，仅当备用上游比主上游更新时才采用
+            UpstreamCommit main = commits.get(0);
+            for (int i = 1; i < commits.size(); i++) {
+                UpstreamCommit candidate = commits.get(i);
+                if (isAncestorLocal(tempGit, main.sha(), candidate.sha())) {
+                    LOGGER.info("Upstream [" + candidate.url() + "] commit " + candidate.sha()
+                            + " is newer than main upstream " + main.sha() + " from [" + main.url() + "], using it.");
+                    return candidate;
+                }
+            }
+            return main;
+        } finally {
+            // 清理临时目录
+            deleteTempDir(tempDir);
+        }
+    }
+
+    private UpstreamCommit queryUpstreamCommit(String url) throws IOException, InterruptedException {
         String ref = upstreamBranch == null || upstreamBranch.isBlank() ? "HEAD" : upstreamBranch;
-        Result result = git.run("ls-remote", "--symref", upstreamUrl, ref);
+        Result result = git.run("ls-remote", "--symref", url, ref);
         if (!result.isSuccess()) {
             throw new IllegalStateException("Failed to query upstream via ls-remote: " + result.stderr());
         }
@@ -133,9 +184,28 @@ public class UpstreamUpdater {
             }
         }
         if (sha == null) {
-            throw new IllegalStateException("Cannot resolve commit sha from ls-remote output for ref '" + ref + "'.");
+            throw new IllegalStateException("Cannot resolve commit sha from ls-remote output for ref '" + ref + "' on " + url);
         }
-        return new LatestCommit(sha, branch);
+        return new UpstreamCommit(sha, branch, url);
+    }
+
+    // 在本地仓库中判断 ancestorSha 是否为 candidateSha 的祖先（即 candidateSha 更新）
+    private boolean isAncestorLocal(GitExecutor localGit, String ancestorSha, String candidateSha) throws IOException, InterruptedException {
+        Result result = localGit.run("merge-base", "--is-ancestor", ancestorSha, candidateSha);
+        return result.isSuccess();
+    }
+
+    private void deleteTempDir(Path dir) throws IOException {
+        if (Files.exists(dir)) {
+            Files.walk(dir)
+                    .sorted(Comparator.reverseOrder())
+                    .forEach(path -> {
+                        try {
+                            Files.deleteIfExists(path);
+                        } catch (IOException ignored) {
+                        }
+                    });
+        }
     }
 
     private void writeNewRef(File propertiesFile, String currentRef, String newRef) throws IOException {

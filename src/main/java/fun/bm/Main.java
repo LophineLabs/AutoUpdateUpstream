@@ -2,7 +2,9 @@ package fun.bm;
 
 import java.io.File;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.logging.Logger;
 
@@ -23,7 +25,7 @@ public class Main {
 
         String repoPath = System.getProperty("user.dir");
         String propertyKey = DEFAULT_PROPERTY_KEY;
-        String upstreamUrl = DEFAULT_UPSTREAM_URL;
+        List<String> upstreamUrls = new ArrayList<>();
         String upstreamBranch = DEFAULT_UPSTREAM_BRANCH;
         String applyTask = DEFAULT_APPLY_TASK;
         String buildTask = DEFAULT_BUILD_TASK;
@@ -50,7 +52,7 @@ public class Main {
                 switch (name) {
                     case "--repo" -> repoPath = value;
                     case "--key" -> propertyKey = value;
-                    case "--url" -> upstreamUrl = value;
+                    case "--url" -> upstreamUrls.add(value);
                     case "--branch" -> upstreamBranch = value;
                     case "--apply" -> applyTask = value;
                     case "--build" -> buildTask = value;
@@ -72,12 +74,16 @@ public class Main {
         File repoDir = Path.of(repoPath).toAbsolutePath().normalize().toFile();
         LOGGER.info("Target repository: " + repoDir.getAbsolutePath());
 
+        if (upstreamUrls.isEmpty()) {
+            upstreamUrls.add(DEFAULT_UPSTREAM_URL);
+        }
+
         if (rebuildTasks.isEmpty()) {
             rebuildTasks = DEFAULT_REBUILD_TASKS;
         }
 
         try {
-            new UpstreamUpdater(repoDir, propertyKey, upstreamUrl, upstreamBranch, applyTask, buildTask, rebuildTasks, fixTask).update();
+            new UpstreamUpdater(repoDir, propertyKey, upstreamUrls, upstreamBranch, applyTask, buildTask, rebuildTasks, fixTask).update();
             LOGGER.info("Upstream update completed successfully.");
         } catch (Exception e) {
             LOGGER.severe("Upstream update failed: " + e.getMessage());
@@ -90,7 +96,7 @@ public class Main {
         LOGGER.info("All options are optional (defaults shown):");
         LOGGER.info("  --repo=<path>    Target repository path (default: current working directory)");
         LOGGER.info("  --key=<name>     Property key in gradle.properties (default: " + DEFAULT_PROPERTY_KEY + ")");
-        LOGGER.info("  --url=<url>      Upstream repository URL (default: " + DEFAULT_UPSTREAM_URL + ")");
+        LOGGER.info("  --url=<url>      Upstream repository URL, repeatable (first = highest priority, default: " + DEFAULT_UPSTREAM_URL + ")");
         LOGGER.info("  --branch=<name>  Upstream branch to track (default: upstream default branch)");
         LOGGER.info("  --apply=<task>   Gradle task to apply changes, empty to skip (default: " + DEFAULT_APPLY_TASK + ")");
         LOGGER.info("  --build=<args>   Gradle build command run after applying, failure skips the rest and exits, empty to skip (default: " + DEFAULT_BUILD_TASK + ")");

@@ -101,7 +101,7 @@ java -jar build/libs/AutoUpdateUpstream-1.0-SNAPSHOT.jar \
 | --- | --- | --- |
 | `--repo` | 目标项目目录 | 当前工作目录 |
 | `--key` | `gradle.properties` 中保存上游 Commit 的配置项名称 | `foliaRef` |
-| `--url` | 上游 Git 仓库 | PaperMC/Folia |
+| `--url` | 上游 Git 仓库，可重复指定多个（第一个为主仓库，后续为备用） | PaperMC/Folia |
 | `--branch` | 需要跟踪的上游分支 | 上游默认分支 |
 | `--apply` | 应用 Patch 使用的 Gradle Task | `applyAllPatches` |
 | `--build` | 应用 Patch 后执行的构建命令 | `build -x test -x scanJarForBadCalls` |
@@ -152,7 +152,7 @@ java -jar AutoUpdateUpstream.jar \
   --branch=master
 ```
 
-也可以自定义整个 Gradle 执行流程：
+可以自定义整个 Gradle 执行流程：
 
 ```bash
 java -jar AutoUpdateUpstream.jar \
@@ -172,6 +172,27 @@ java -jar AutoUpdateUpstream.jar \
 --rebuild=rebuildApiPatches
 ```
 
+## 多上游仓库支持
+
+`--url` 可以重复指定多个上游仓库地址，所有地址应指向同一个上游代码源的不同镜像。
+
+```bash
+java -jar AutoUpdateUpstream.jar \
+  --repo=/path/to/repo \
+  --url=https://github.com/PaperMC/Folia.git \
+  --url=https://github.com/SomeMirror/Folia.git
+```
+
+程序会按传入顺序确定优先级（第一个为主仓库），然后比较各上游的最新 Commit，选择最新的执行更新。
+
+判断逻辑：
+
+- 使用 `git merge-base --is-ancestor` 比较 Commit 新旧
+- 主仓库优先，仅当备用仓库的 Commit 严格比主仓库更新时才采用
+- 如果所有上游 Commit 相同，则使用主仓库
+
+典型场景：主仓库访问受限或不稳定时，可以通过备用镜像加速获取最新 Commit。
+
 部分步骤也可以通过传入空值关闭，例如：
 
 ```bash
@@ -182,10 +203,11 @@ java -jar AutoUpdateUpstream.jar \
 
 ## GitHub Actions
 
-项目中提供了一个可直接修改使用的 GitHub Actions 示例：
+项目中提供了两个 GitHub Actions 示例模板：
 
 ```text
-auto-update-upstream-sample.yml
+auto-update-upstream-sample.yml    # 单上游仓库模板（默认）
+auto-update-upstream-sample-2.yml  # 多上游仓库模板（支持备用镜像）
 ```
 
 可以将其复制到目标仓库：
@@ -195,6 +217,8 @@ auto-update-upstream-sample.yml
 ```
 
 示例 Workflow 默认每 8 小时检查一次上游更新，同时支持通过 `workflow_dispatch` 手动执行。
+
+如果你的上游仓库存在多个镜像，建议使用模板 2 以提高可用性。
 
 ### 主要配置
 
