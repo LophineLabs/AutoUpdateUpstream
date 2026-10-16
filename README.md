@@ -244,10 +244,10 @@ env:
 
 示例 Workflow 大致会执行以下操作：
 
-1. 从 `gradle.properties` 中读取当前上游 Commit
+1. 从默认分支的 `gradle.properties` 中读取当前所基于的上游 Commit
 2. 查询上游最新 Commit
-3. 如果当前已经是最新版则直接结束
-4. 检查已有的上游同步 PR
+3. 只有默认分支已经是最新版时才跳过更新。自动更新分支即使已经指向最新 Commit，只要默认分支仍落后，仍会完整执行后续更新
+4. 默认分支已是最新版时，仅检查已有的上游同步 PR
 5. Checkout `AutoUpdateUpstream`
 6. 构建 `AutoUpdateUpstream`
 7. 在目标项目中运行更新工具
