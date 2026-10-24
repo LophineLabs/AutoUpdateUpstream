@@ -99,7 +99,7 @@ public class Main {
         LOGGER.info("  --url=<url>      Upstream repository URL, repeatable (first = highest priority, default: " + DEFAULT_UPSTREAM_URL + ")");
         LOGGER.info("  --branch=<name>  Upstream branch to track (default: upstream default branch)");
         LOGGER.info("  --apply=<task>   Gradle task to apply changes, empty to skip (default: " + DEFAULT_APPLY_TASK + ")");
-        LOGGER.info("  --build=<args>   Gradle build command run after applying, failure skips the rest and exits, empty to skip (default: " + DEFAULT_BUILD_TASK + ")");
+        LOGGER.info("  --build=<args>   Gradle build command run after applying, failure throws and aborts, empty to skip (default: " + DEFAULT_BUILD_TASK + ")");
         LOGGER.info("  --fix=<task>     Gradle fix task run after rebuilding patches, empty to skip (default: " + DEFAULT_FIX_TASK + ")");
         LOGGER.info("  --rebuild=<task> Gradle task to rebuild patches, repeatable, empty to skip (default: "
                 + String.join(", ", DEFAULT_REBUILD_TASKS) + ")");

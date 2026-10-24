@@ -74,14 +74,9 @@ public class UpstreamUpdater {
             }
         }
 
-        // apply 完成后先执行构建（默认跳过测试），失败则跳过后续步骤直接退出
+        // apply 完成后先执行构建（默认跳过测试），失败则抛出错误，不再继续 rebuild/fix
         if (buildTask != null && !buildTask.isBlank()) {
-            int buildExitCode = runGradleRaw(buildTask);
-            if (buildExitCode != 0) {
-                LOGGER.warning("Gradle build '" + buildTask + "' failed with exit code " + buildExitCode
-                        + ", skipping rebuild/fix tasks and exiting.");
-                return;
-            }
+            runGradleTask(buildTask);
         }
 
         // 构建成功后逐个执行 rebuild 任务，重新生成补丁文件；为空则跳过，传空值可显式禁用
