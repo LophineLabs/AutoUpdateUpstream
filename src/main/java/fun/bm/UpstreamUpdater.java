@@ -67,7 +67,7 @@ public class UpstreamUpdater {
                 runGradleTask(applyTask);
             } catch (IllegalStateException e) {
                 LOGGER.warning("Apply task '" + applyTask + "' failed: " + e.getMessage());
-                LOGGER.warning("Trying fallback: rewrite and manually apply build.gradle.kts.patch...");
+                LOGGER.warning("Trying fallback: rewrite build.gradle.kts.patch and retry apply...");
                 if (!fallbackApplyBuildGradlePatches()) {
                     throw e;
                 }
@@ -213,66 +213,182 @@ public class UpstreamUpdater {
         Files.writeString(propertiesFile.toPath(), updated, StandardCharsets.UTF_8);
     }
 
-    // apply 任务失败时的兜底：在根目录一级子目录中查找 build.gradle.kts.patch，
-    // 将其中的 "_," 替换为 "1," 后宽松应用（不严格校验前后文，基本匹配即视为成功）
+    // apply 任务失败时的兜底：改写一级子目录中的 build.gradle.kts.patch，再重试 Gradle apply。
+    // Paperweight 自己应用这些补丁，只改写而不重跑 apply 不会让任务恢复。
+    // 仍失败时再对补丁做降级 apply（降低上下文 / fuzz），成功后再重试一次 apply。
     private boolean fallbackApplyBuildGradlePatches() throws IOException, InterruptedException {
         File[] children = repoDir.listFiles(File::isDirectory);
         if (children == null) {
             return false;
         }
-        int found = 0;
-        int applied = 0;
+        List<File> patchFiles = new ArrayList<>();
         for (File dir : children) {
             File patchFile = new File(dir, "build.gradle.kts.patch");
-            if (!patchFile.isFile()) {
-                continue;
+            if (patchFile.isFile()) {
+                patchFiles.add(patchFile);
             }
-            found++;
-            rewritePatchUnderscore(patchFile);
-            if (applyPatchLoosely(dir, patchFile.getName())) {
+        }
+        if (patchFiles.isEmpty()) {
+            LOGGER.warning("Fallback found no build.gradle.kts.patch files under " + repoDir.getAbsolutePath());
+            return false;
+        }
+
+        boolean rewritten = false;
+        for (File patchFile : patchFiles) {
+            if (rewritePatchUnderscore(patchFile)) {
+                rewritten = true;
+            }
+        }
+
+        if (rewritten && retryApplyTask("after rewriting build.gradle.kts.patch")) {
+            return true;
+        }
+
+        if (rewritten) {
+            LOGGER.warning("Retrying Gradle apply failed; trying degraded (fuzz / -C0) apply of build.gradle.kts.patch...");
+        } else {
+            LOGGER.warning("Trying degraded (fuzz / -C0) apply of build.gradle.kts.patch...");
+        }
+        int applied = 0;
+        for (File patchFile : patchFiles) {
+            if (applyPatchLoosely(patchFile.getParentFile(), patchFile.getName())) {
                 applied++;
             }
         }
-        LOGGER.info("Fallback finished: applied " + applied + "/" + found + " build.gradle.kts.patch file(s).");
-        return found > 0 && applied == found;
+        LOGGER.info("Fallback finished: applied " + applied + "/" + patchFiles.size() + " build.gradle.kts.patch file(s).");
+        if (applied != patchFiles.size()) {
+            return false;
+        }
+        retryApplyTask("after loosely applying build.gradle.kts.patch");
+        return true;
     }
 
-    private void rewritePatchUnderscore(File patchFile) throws IOException {
+    private boolean retryApplyTask(String reason) throws IOException, InterruptedException {
+        if (applyTask == null || applyTask.isBlank()) {
+            return false;
+        }
+        String retryCommand = applyTask.contains("--rerun-tasks") ? applyTask : applyTask + " --rerun-tasks";
+        try {
+            runGradleTask(retryCommand);
+            LOGGER.info("Apply task '" + applyTask + "' succeeded " + reason + ".");
+            return true;
+        } catch (IllegalStateException e) {
+            LOGGER.warning("Apply task '" + applyTask + "' failed " + reason + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private boolean rewritePatchUnderscore(File patchFile) throws IOException {
         String content = Files.readString(patchFile.toPath(), StandardCharsets.UTF_8);
         String replaced = content.replace("_,", "1,");
-        if (!replaced.equals(content)) {
-            Files.writeString(patchFile.toPath(), replaced, StandardCharsets.UTF_8);
-            LOGGER.info("Replaced '_,', '1,' in " + patchFile.getAbsolutePath());
+        if (replaced.equals(content)) {
+            return false;
         }
+        Files.writeString(patchFile.toPath(), replaced, StandardCharsets.UTF_8);
+        LOGGER.info("Replaced '_,', '1,' in " + patchFile.getAbsolutePath());
+        return true;
     }
 
     private boolean applyPatchLoosely(File dir, String patchName) throws IOException, InterruptedException {
-        GitExecutor localGit = new GitExecutor(dir);
-        String patchPath = new File(dir, patchName).getAbsolutePath();
-        // 依次尝试：常规应用(-p1/-p0) -> 三方合并，逐步放宽匹配条件
+        File patchFile = new File(dir, patchName);
+        String patchPath = patchFile.getAbsolutePath();
+        File target = new File(dir, "build.gradle.kts");
+        if (!target.isFile()) {
+            LOGGER.warning("Skipping loose git apply for " + patchPath
+                    + ": no build.gradle.kts in " + dir.getAbsolutePath()
+                    + " (paperweight applies this patch during '" + applyTask + "')");
+            return false;
+        }
+        String module = dir.getName();
+        GitExecutor repoGit = new GitExecutor(repoDir);
+
+        // git apply 会从仓库根解析路径；在子目录里直接 apply 会打到错误位置。
+        // 降级顺序：丢掉上下文（-C0/--recount）→ 按模块目录偏移 → 三方合并。
         String[][] attempts = {
-                {"apply", "--ignore-whitespace", "-p1", patchName},
-                {"apply", "--ignore-whitespace", "-p0", patchName},
-                {"apply", "--ignore-whitespace", "--3way", "-p1", patchName},
-                {"apply", "--ignore-whitespace", "--3way", "-p0", patchName}
+                {"apply", "--ignore-whitespace", "--recount", "-C0", "--directory=" + module, "-p1", patchPath},
+                {"apply", "--ignore-whitespace", "--recount", "-C0", "--directory=" + module, "-p0", patchPath},
+                {"apply", "--ignore-whitespace", "--recount", "-C0", "-p1", patchPath},
+                {"apply", "--ignore-whitespace", "--recount", "-C0", "-p0", patchPath},
+                {"apply", "--ignore-whitespace", "--unidiff-zero", "--directory=" + module, "-p1", patchPath},
+                {"apply", "--ignore-whitespace", "-p1", patchPath},
+                {"apply", "--ignore-whitespace", "--3way", "--directory=" + module, "-p1", patchPath},
+                {"apply", "--ignore-whitespace", "--3way", "-p1", patchPath}
         };
+        Result last = null;
         for (String[] attempt : attempts) {
-            Result result = localGit.run(attempt);
-            if (result.isSuccess()) {
-                LOGGER.info("Patch applied successfully: " + patchPath);
+            last = repoGit.run(attempt);
+            if (last.isSuccess()) {
+                LOGGER.info("Patch applied successfully (" + String.join(" ", attempt) + "): " + patchPath);
                 return true;
             }
         }
-        // 最后兜底：允许部分应用（--reject），不完全校验前后文，基本符合即可
-        for (String strip : new String[]{"-p1", "-p0"}) {
-            Result result = localGit.run("apply", "--ignore-whitespace", "--reject", strip, patchName);
-            if (result.isSuccess()) {
+        if (applyWithPatchCommand(dir, patchName)) {
+            LOGGER.info("Patch applied with patch(1) fuzz: " + patchPath);
+            return true;
+        }
+        // --reject 在部分 hunk 失败时仍返回 1；出现 reject 即视为降级成功
+        String[][] rejectAttempts = {
+                {"apply", "--ignore-whitespace", "--recount", "-C0", "--reject", "--directory=" + module, "-p1", patchPath},
+                {"apply", "--ignore-whitespace", "--recount", "-C0", "--reject", "-p1", patchPath},
+                {"apply", "--ignore-whitespace", "--recount", "-C0", "--reject", "-p0", patchPath}
+        };
+        for (String[] attempt : rejectAttempts) {
+            last = repoGit.run(attempt);
+            if (last.isSuccess() || isPartialRejectApply(last)) {
                 LOGGER.warning("Patch applied loosely (some hunks may be rejected): " + patchPath);
                 return true;
             }
         }
-        LOGGER.severe("Failed to apply patch even loosely: " + patchPath);
+        LOGGER.severe("Failed to apply patch even loosely: " + patchPath
+                + (last == null ? "" : ": " + firstNonBlank(last.stderr(), last.stdout())));
         return false;
+    }
+
+    private boolean applyWithPatchCommand(File dir, String patchName) throws IOException, InterruptedException {
+        for (String strip : new String[]{"-p1", "-p0", "-p2"}) {
+            List<String> command = new ArrayList<>();
+            command.add("patch");
+            command.add(strip);
+            command.add("-N");
+            command.add("-l");
+            command.add("--fuzz=3");
+            command.add("--no-backup-if-mismatch");
+            command.add("-i");
+            command.add(patchName);
+            ProcessBuilder builder = new ProcessBuilder(command);
+            builder.directory(dir);
+            builder.redirectErrorStream(true);
+            try {
+                Process process = builder.start();
+                String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                int exitCode = process.waitFor();
+                if (exitCode == 0) {
+                    return true;
+                }
+                LOGGER.warning("patch(1) " + strip + " failed for " + patchName + " (exit " + exitCode + "): " + output);
+            } catch (IOException e) {
+                LOGGER.warning("patch(1) is not available: " + e.getMessage());
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isPartialRejectApply(Result result) {
+        if (result == null || result.exitCode() != 1) {
+            return false;
+        }
+        String text = (result.stdout() + "\n" + result.stderr()).toLowerCase(Locale.ROOT);
+        return text.contains("with rejects") || text.contains(".rej");
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
     }
 
     private void runGradleTask(String task) throws IOException, InterruptedException {
