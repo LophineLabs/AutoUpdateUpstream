@@ -33,7 +33,7 @@
         ↓
 applyAllPatches
         ↓
-build -x test -x scanJarForBadCalls
+createPaperclipJar
         ↓
 rebuildAllServerPatches
 rebuildFoliaApiPatches
@@ -104,7 +104,7 @@ java -jar build/libs/AutoUpdateUpstream-1.0-SNAPSHOT.jar \
 | `--url` | 上游 Git 仓库，可重复指定多个（第一个为主仓库，后续为备用） | PaperMC/Folia |
 | `--branch` | 需要跟踪的上游分支 | 上游默认分支 |
 | `--apply` | 应用 Patch 使用的 Gradle Task | `applyAllPatches` |
-| `--build` | 应用 Patch 后执行的构建命令 | `build -x test -x scanJarForBadCalls` |
+| `--build` | 应用 Patch 后执行的构建命令 | `createPaperclipJar` |
 | `--rebuild` | Patch 重建 Task，可重复指定多个 | 见下方 |
 | `--fix` | 最后执行的 Patch 修复 Task | `rebuildFoliaSingleFilePatches` |
 
@@ -285,7 +285,7 @@ Workflow 需要具备：
 默认执行：
 
 ```bash
-./gradlew build -x test -x scanJarForBadCalls
+./gradlew createPaperclipJar
 ```
 
 如果项目构建失败（包括测试失败），程序会抛出错误并退出，不再执行后续 Patch 重建流程。
