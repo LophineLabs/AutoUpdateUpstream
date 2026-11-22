@@ -16,7 +16,7 @@ public class Main {
     // 空表示使用上游仓库的默认分支
     private static final String DEFAULT_UPSTREAM_BRANCH = "";
     private static final String DEFAULT_APPLY_TASK = "applyAllPatches";
-    private static final String DEFAULT_BUILD_TASK = "build -x test -x scanJarForBadCalls";
+    private static final String DEFAULT_BUILD_TASK = "createPaperclipJar";
     private static final String DEFAULT_FIX_TASK = "rebuildFoliaSingleFilePatches";
     private static final Set<String> DEFAULT_REBUILD_TASKS = Set.of("rebuildAllServerPatches", "rebuildFoliaApiPatches", "rebuildPaperApiPatches");
 
