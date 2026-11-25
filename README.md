@@ -301,9 +301,11 @@ Patch 型 Fork 在更新上游时，可能因为上游代码变化导致已有 P
 当普通 Patch 应用失败时，程序会：
 
 - 递归查找仓库中的 `build.gradle.kts.patch`（跳过 `.git`、`.gradle`、`build`）
-- 先把 hunk 头里的行数占位符 `_`（如 `@@ -143,_ +187,21 @@`）按正文算成真实行数，再立刻重跑 Gradle apply 任务；
-  不这样做 `git apply` 会直接报 `corrupt patch`；正文里的 `_,`（如 Kotlin 解构 `{ (_, value) -> }`）不会被改动，
-  完全放弃时才会还原补丁
+- 先解开 hunk 头里的 `_` 占位符（comfreyweight 会把无法预先确定的数字写成 `_`，
+  如 `@@ -66,6 +_,7 @@` 的新侧起始行），再立刻重跑 Gradle apply 任务；
+  不这样做 `git apply` 会直接报 `corrupt patch`。
+  推算方式与 diff 一致：行数取自正文，新侧起始行 = 旧侧起始行 + 之前 hunk 的净增行数；
+  正文里的 `_,`（如 Kotlin 解构 `{ (_, value) -> }`）不会被改动，完全放弃时才会还原补丁
 - 从补丁头（`---` / `+++` / `diff --git`）解析出真正被修改的文件，
   再按「仓库根相对路径 → 补丁所在模块 → 按文件名搜索」定位它
 - 按目标文件在仓库里的实际位置推导 `-p` 层数和 `--directory`，避免打到错误位置
@@ -316,6 +318,13 @@ Patch 型 Fork 在更新上游时，可能因为上游代码变化导致已有 P
   就用「上游原文 → 实际生效内容」重新生成 `.patch` 文件，让重试的 Gradle apply 能干净地应用；
   被拒绝的 hunk 里的 Fork 改动会丢失，必须从 PR 里人工补回
 - 上游已经带上同样改动时识别为“已应用”，不重复插入
+- 重试 Gradle apply 前，会删除本次运行期间新生成、且未被 git 跟踪的 `*.settings.gradle.kts`
+
+最后一条针对的是 apply 被中断后的级联失败：构建会在仓库根生成 settings 片段（如
+`test-plugin.settings.gradle.kts`），它把还没准备好的模块 include 进来，导致后续任何
+Gradle 调用都在 configuration 阶段就失败（例如 `Project with path ':folia-api' could not be found`）。
+删除它可以让 settings 回到中断前的求值结果；仓库自带的、已被跟踪的、以及本次运行之前就存在的
+文件均不会被碰，日志会写明删了哪个文件。
 
 单文件补丁修改的文件常常不在补丁所在的模块，例如 `lophine-server/build.gradle.kts.patch`
 改的是 `folia-server/build.gradle.kts`，这类情况现在也能处理。
