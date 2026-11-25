@@ -19,8 +19,9 @@ public class UpstreamUpdater {
     // 单文件补丁名，以及兜底时在仓库里搜索文件的最大目录深度
     private static final String PATCH_FILE_NAME = "build.gradle.kts.patch";
     private static final int MAX_SEARCH_DEPTH = 8;
+    private static final Pattern HUNK_HEADER = Pattern.compile("^@@ -(\\d+),(\\d+|_) \\+(\\d+),(\\d+|_) @@(.*)$");
 
-    // 记录 “_,” 改写前的补丁内容，以便重试失败时还原
+    // 记录 hunk 头占位符解析前的补丁内容，以在完全放弃时还原
     private final Map<File, String> rewriteBackup = new LinkedHashMap<>();
 
     public record UpstreamCommit(String sha, String branch, String url) {
@@ -220,7 +221,7 @@ public class UpstreamUpdater {
         Files.writeString(propertiesFile.toPath(), updated, StandardCharsets.UTF_8);
     }
 
-    // apply 任务失败时的兜底：先只改写 hunk 头里的行数占位符并重试（补丁是 Paperweight 自己读的）；
+    // apply 任务失败时的兜底：先把 hunk 头里的 "_" 行数占位符算成真实行数并重试（补丁是 Paperweight 自己读的）；
     // 仍失败则定位并恢复上游原始文件，降级应用补丁，必要时用实际生效的改动重新生成补丁文件，最后重试一次 apply。
     private boolean fallbackApplyBuildGradlePatches() throws IOException, InterruptedException {
         List<File> patchFiles = new ArrayList<>();
@@ -232,16 +233,16 @@ public class UpstreamUpdater {
 
         boolean rewritten = false;
         for (File patchFile : patchFiles) {
-            if (rewritePatchUnderscore(patchFile)) {
+            if (normalizePatchHunkCounts(patchFile)) {
                 rewritten = true;
             }
         }
 
         if (rewritten) {
-            if (retryApplyTask("after rewriting " + PATCH_FILE_NAME)) {
+            if (retryApplyTask("after resolving '_' hunk counts")) {
                 return true;
             }
-            restoreRewrittenPatches();
+            // 解析后的 hunk 头仍然是合法补丁（只是把占位符换成了真实行数），保留它才能让下面的手动应用被 git 解析
             LOGGER.warning("Retrying Gradle apply failed; trying degraded (fuzz / --reject) apply of " + PATCH_FILE_NAME + "...");
         } else {
             LOGGER.warning("Trying degraded (fuzz / --reject) apply of " + PATCH_FILE_NAME + "...");
@@ -266,10 +267,12 @@ public class UpstreamUpdater {
             for (File patchFile : unresolved) {
                 LOGGER.severe("Patch could not be applied even loosely: " + patchFile.getAbsolutePath());
             }
+            restoreRewrittenPatches();
             return false;
         }
         if (applied == 0) {
             LOGGER.severe("No " + PATCH_FILE_NAME + " could be applied manually, giving up.");
+            restoreRewrittenPatches();
             return false;
         }
         // 上游 apply 任务是在第一个失败补丁处中断的，后面的模块可能连检出都没生成，
@@ -444,38 +447,82 @@ public class UpstreamUpdater {
         }
     }
 
-    // 只处理 hunk 头里的行数占位符（如 "@@ -1,_ +1,4 @@"）。
-    // 不能全文替换 "_,"：补丁正文里的 Kotlin 解构 { (_, value) -> } 同样包含 "_,"，
-    // 全文替换会把补丁正文改坏（改成 (1, value)），反而造成新的失败。
-    private boolean rewritePatchUnderscore(File patchFile) throws IOException {
+    // 只处理 hunk 头里的行数占位符。comfreyweight 生成的补丁用 "_" 表示“由应用方按正文计算行数”
+    // （如 "@@ -143,_ +187,21 @@"），git apply 解析不了这种头，会直接报 "corrupt patch"。
+    // 这里把真实行数算出来写回头部，得到的仍是合法补丁（应用方自己也是这么算的）。
+    // 注意不能全文替换 "_,"：补丁正文里的 Kotlin 解构 { (_, value) -> } 同样含 "_,"，会被改坏。
+    private boolean normalizePatchHunkCounts(File patchFile) throws IOException {
         String content = Files.readString(patchFile.toPath(), StandardCharsets.UTF_8);
-        Matcher matcher = Pattern.compile("(?m)^@@[^\r\n]*$").matcher(content);
-        StringBuilder updated = new StringBuilder();
+        String newline = content.contains("\r\n") ? "\r\n" : "\n";
+        String[] lines = content.split("\r?\n", -1);
         boolean changed = false;
-        while (matcher.find()) {
-            String line = matcher.group();
-            String fixed = line.replace("_,", "1,").replace(",_", ",1");
-            if (fixed.equals(line)) {
+        for (int i = 0; i < lines.length; i++) {
+            String header = lines[i];
+            if (!header.startsWith("@@") || !header.contains("_")) {
                 continue;
             }
+            Matcher matcher = HUNK_HEADER.matcher(header);
+            if (!matcher.matches()) {
+                LOGGER.warning("Unparsable hunk header, leaving the patch as is: " + header);
+                return false;
+            }
+            int[] counts = countHunkBody(lines, i + 1);
+            String fixed = "@@ -" + matcher.group(1) + "," + resolveCount(matcher.group(2), counts[0])
+                    + " +" + matcher.group(3) + "," + resolveCount(matcher.group(4), counts[1])
+                    + " @@" + matcher.group(5);
+            if (fixed.equals(header)) {
+                continue;
+            }
+            lines[i] = fixed;
             changed = true;
-            matcher.appendReplacement(updated, Matcher.quoteReplacement(fixed));
         }
-        matcher.appendTail(updated);
         if (!changed) {
             return false;
         }
         rewriteBackup.put(patchFile, content);
-        Files.writeString(patchFile.toPath(), updated.toString(), StandardCharsets.UTF_8);
-        LOGGER.info("Normalized '_' line-count placeholders in hunk headers of " + patchFile.getAbsolutePath());
+        Files.writeString(patchFile.toPath(), String.join(newline, lines), StandardCharsets.UTF_8);
+        LOGGER.info("Resolved '_' line-count placeholders in hunk headers of " + patchFile.getAbsolutePath());
         return true;
     }
 
-    // 改写补丁后重试没成功时还原原内容，避免把改坏的补丁留在工作区里继续参与后续应用
+    private static String resolveCount(String token, int computed) {
+        return "_".equals(token) ? Integer.toString(computed) : token;
+    }
+
+    // 按 hunk 正文统计旧/新侧行数：上下文行两边都算，“-”只算旧侧，“+”只算新侧
+    private static int[] countHunkBody(String[] lines, int start) {
+        int oldCount = 0;
+        int newCount = 0;
+        for (int i = start; i < lines.length; i++) {
+            String line = lines[i];
+            // 文件末尾换行号产生的空元素不是上下文行
+            if (i == lines.length - 1 && line.isEmpty()) {
+                break;
+            }
+            if (line.startsWith("@@") || line.startsWith("--- ") || line.startsWith("+++ ")
+                    || line.startsWith("diff ") || line.startsWith("index ")) {
+                break;
+            }
+            if (line.startsWith("\\")) {
+                continue; // "\ No newline at end of file"
+            }
+            if (line.startsWith("+")) {
+                newCount++;
+            } else if (line.startsWith("-")) {
+                oldCount++;
+            } else {
+                oldCount++;
+                newCount++;
+            }
+        }
+        return new int[]{oldCount, newCount};
+    }
+
+    // 放弃兜底时还原改写前的补丁，避免把未验证的改动留在工作区
     private void restoreRewrittenPatches() throws IOException {
         for (Map.Entry<File, String> entry : rewriteBackup.entrySet()) {
             Files.writeString(entry.getKey().toPath(), entry.getValue(), StandardCharsets.UTF_8);
-            LOGGER.info("Restored rewritten patch after the retry failed: " + entry.getKey().getAbsolutePath());
+            LOGGER.info("Restored rewritten patch: " + entry.getKey().getAbsolutePath());
         }
         rewriteBackup.clear();
     }
@@ -529,12 +576,13 @@ public class UpstreamUpdater {
         };
         Result last = null;
         for (ApplyOption option : options) {
-            for (String[] flags : flagSets) {
+            for (int f = 0; f < flagSets.length; f++) {
+                String[] flags = flagSets[f];
                 last = runGitApply(repoGit, flags, option, patchPath);
                 if (last.isSuccess()) {
-                    LOGGER.info("Patch applied successfully (" + describe(option) + " " + String.join(" ", flags)
-                            + "): " + patchPath);
-                    return ApplyOutcome.APPLIED;
+                    LOGGER.info("Patch applied (" + describe(option) + " " + String.join(" ", flags) + "): " + patchPath);
+                    // 只有第一种完整上下文匹配成功不需要重写补丁
+                    return finishApplied(patchFile, pristine, target, headerPaths, f > 0, false);
                 }
             }
         }
@@ -551,7 +599,7 @@ public class UpstreamUpdater {
                 }
                 if (result.exitCode() == 0) {
                     LOGGER.info("Patch applied with patch(1) " + describe(option) + " --fuzz=" + fuzz + ": " + patchPath);
-                    return ApplyOutcome.APPLIED;
+                    return finishApplied(patchFile, pristine, target, headerPaths, true, false);
                 }
                 best = better(best, attemptOf(target, result, total));
                 last = result;
@@ -568,9 +616,8 @@ public class UpstreamUpdater {
                 writeContent(target, pristine);
                 last = runGitApply(repoGit, flags, option, patchPath);
                 if (last.isSuccess()) {
-                    LOGGER.info("Patch applied successfully (" + describe(option) + " " + String.join(" ", flags)
-                            + "): " + patchPath);
-                    return ApplyOutcome.APPLIED;
+                    LOGGER.info("Patch applied (" + describe(option) + " " + String.join(" ", flags) + "): " + patchPath);
+                    return finishApplied(patchFile, pristine, target, headerPaths, true, false);
                 }
                 best = better(best, attemptOf(target, last, total));
             }
@@ -578,19 +625,29 @@ public class UpstreamUpdater {
 
         if (best != null && best.applied() > 0) {
             writeContent(target, best.content());
-            cleanByproducts(target);
-            boolean regenerated = regeneratePatchFile(patchFile, pristine, target, headerPaths);
-            LOGGER.warning("Patch " + patchPath + " only matched " + best.applied() + "/" + total + " hunk(s): "
-                    + (regenerated ? "the patch file was regenerated from the applied state"
-                            : "the patched file was updated but the patch file was left unchanged")
-                    + "; rejected hunks must be reviewed manually");
-            return ApplyOutcome.APPLIED;
+            LOGGER.warning("Patch " + patchPath + " only matched " + best.applied() + "/" + total + " hunk(s)");
+            return finishApplied(patchFile, pristine, target, headerPaths, true, true);
         }
 
         writeContent(target, pristine);
         LOGGER.severe("Failed to apply patch even loosely: " + patchPath
                 + (last == null ? "" : ": " + firstNonBlank(last.stderr(), last.stdout())));
         return ApplyOutcome.FAILED;
+    }
+
+    // 手动应用成功后的收尾：只要用到了降级匹配（丢上下文 / fuzz / 丢 hunk），
+    // 就要用「上游原文 → 实际生效内容」重新生成补丁，否则重试的 Gradle apply 仍会按旧上下文失败
+    private ApplyOutcome finishApplied(File patchFile, byte[] pristine, File target, List<String> headerPaths,
+                                       boolean degraded, boolean partial) throws IOException {
+        cleanByproducts(target);
+        if (!degraded) {
+            return ApplyOutcome.APPLIED;
+        }
+        boolean regenerated = regeneratePatchFile(patchFile, pristine, target, headerPaths);
+        LOGGER.warning((partial ? "Rejected hunks were dropped" : "Patch only matched with degraded context handling")
+                + (regenerated ? "; the patch file was regenerated, review the resulting changes: "
+                        : "; the patch file was left unchanged: ") + patchFile.getAbsolutePath());
+        return ApplyOutcome.APPLIED;
     }
 
     // 一次部分应用尝试的结果：真正应用上的 hunk 数与实际写入的文件内容
@@ -649,7 +706,13 @@ public class UpstreamUpdater {
         String relative = root.toPath().toAbsolutePath().normalize()
                 .relativize(target.toPath().toAbsolutePath().normalize())
                 .toString().replace(File.separatorChar, '/');
-        Result result = new GitExecutor(root).run("checkout", "--", relative);
+        GitExecutor upstreamGit = new GitExecutor(root);
+        // 上游目录可能经过 filter 任务处理，目标文件未必在索引里；未跟踪时无处可恢复，用当前内容作为基准
+        if (upstreamGit.run("ls-files", "--", relative).stdout().isBlank()) {
+            LOGGER.info(relative + " is not tracked by the upstream checkout, using its current content as the baseline");
+            return;
+        }
+        Result result = upstreamGit.run("checkout", "--", relative);
         if (result.isSuccess()) {
             LOGGER.info("Reset patch target to upstream content before re-applying: " + relative
                     + " in " + root.getAbsolutePath());
@@ -675,7 +738,7 @@ public class UpstreamUpdater {
     }
 
     // 上下文过期导致部分 hunk 打不上时，用「恢复后的上游内容 → 实际打上的改动」重新生成补丁，
-    // 重试的 Gradle apply 就能干净地应用；代价是被拒绝的 hunk 好丢会丢失，需要从 PR 里人工补回
+    // 重试的 Gradle apply 就能干净地应用；代价是被拒绝 hunk 里的 Fork 改动会丢失，需要从 PR 里人工补回
     private boolean regeneratePatchFile(File patchFile, byte[] pristine, File target, List<String> headerPaths)
             throws IOException {
         Set<String> normalized = new LinkedHashSet<>();
@@ -705,6 +768,8 @@ public class UpstreamUpdater {
                 return false;
             }
             Files.writeString(patchFile.toPath(), output, StandardCharsets.UTF_8);
+            // 重新生成的补丁已经不再需要还原（否则后续 restore 会把重生成结果顶掉）
+            rewriteBackup.remove(patchFile);
             LOGGER.info("Regenerated patch from the applied state: " + patchFile.getAbsolutePath());
             return true;
         } catch (InterruptedException e) {
