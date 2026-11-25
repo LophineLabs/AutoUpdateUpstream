@@ -16,6 +16,10 @@ import java.util.regex.Pattern;
 public class UpstreamUpdater {
     private static final Logger LOGGER = Logger.getLogger("AutoUpdate-Updater");
 
+    // 单文件补丁名，以及兜底时在仓库里搜索文件的最大目录深度
+    private static final String PATCH_FILE_NAME = "build.gradle.kts.patch";
+    private static final int MAX_SEARCH_DEPTH = 8;
+
     public record UpstreamCommit(String sha, String branch, String url) {
     }
 
@@ -213,23 +217,14 @@ public class UpstreamUpdater {
         Files.writeString(propertiesFile.toPath(), updated, StandardCharsets.UTF_8);
     }
 
-    // apply 任务失败时的兜底：改写一级子目录中的 build.gradle.kts.patch，再重试 Gradle apply。
+    // apply 任务失败时的兜底：改写仓库中的 build.gradle.kts.patch，再重试 Gradle apply。
     // Paperweight 自己应用这些补丁，只改写而不重跑 apply 不会让任务恢复。
-    // 仍失败时再对补丁做降级 apply（降低上下文 / fuzz），成功后再重试一次 apply。
+    // 仍失败时再对补丁做降级 apply（降低上下文 / fuzz / --reject），成功后再重试一次 apply。
     private boolean fallbackApplyBuildGradlePatches() throws IOException, InterruptedException {
-        File[] children = repoDir.listFiles(File::isDirectory);
-        if (children == null) {
-            return false;
-        }
         List<File> patchFiles = new ArrayList<>();
-        for (File dir : children) {
-            File patchFile = new File(dir, "build.gradle.kts.patch");
-            if (patchFile.isFile()) {
-                patchFiles.add(patchFile);
-            }
-        }
+        walkFiles(repoDir, MAX_SEARCH_DEPTH, Set.of(".gradle", "build"), PATCH_FILE_NAME, patchFiles);
         if (patchFiles.isEmpty()) {
-            LOGGER.warning("Fallback found no build.gradle.kts.patch files under " + repoDir.getAbsolutePath());
+            LOGGER.warning("Fallback found no " + PATCH_FILE_NAME + " files under " + repoDir.getAbsolutePath());
             return false;
         }
 
@@ -240,27 +235,191 @@ public class UpstreamUpdater {
             }
         }
 
-        if (rewritten && retryApplyTask("after rewriting build.gradle.kts.patch")) {
+        if (rewritten && retryApplyTask("after rewriting " + PATCH_FILE_NAME)) {
             return true;
         }
 
         if (rewritten) {
-            LOGGER.warning("Retrying Gradle apply failed; trying degraded (fuzz / -C0) apply of build.gradle.kts.patch...");
+            LOGGER.warning("Retrying Gradle apply failed; trying degraded (fuzz / --reject) apply of " + PATCH_FILE_NAME + "...");
         } else {
-            LOGGER.warning("Trying degraded (fuzz / -C0) apply of build.gradle.kts.patch...");
+            LOGGER.warning("Trying degraded (fuzz / --reject) apply of " + PATCH_FILE_NAME + "...");
         }
+        List<File> unresolved = new ArrayList<>();
+        List<File> notCheckedOut = new ArrayList<>();
         int applied = 0;
         for (File patchFile : patchFiles) {
-            if (applyPatchLoosely(patchFile.getParentFile(), patchFile.getName())) {
-                applied++;
+            switch (applyPatchLoosely(patchFile)) {
+                case APPLIED -> applied++;
+                case NOT_FOUND -> notCheckedOut.add(patchFile);
+                case FAILED -> unresolved.add(patchFile);
             }
         }
-        LOGGER.info("Fallback finished: applied " + applied + "/" + patchFiles.size() + " build.gradle.kts.patch file(s).");
-        if (applied != patchFiles.size()) {
+        LOGGER.info("Fallback finished: applied " + applied + "/" + patchFiles.size() + " " + PATCH_FILE_NAME + " file(s), "
+                + notCheckedOut.size() + " without a resolvable target.");
+        for (File patchFile : notCheckedOut) {
+            LOGGER.warning("Patch target not found in the working tree, leaving it to the Gradle apply task: "
+                    + patchFile.getAbsolutePath());
+        }
+        // 上游 apply 任务是在第一个失败补丁处中断的，后面的模块可能连检出都没生成，
+        // 因此只要把能处理的补丁处理完就重试，避免因为上游一个版本号的改动丢掉整个自动更新。
+        if (retryApplyTask("after loosely applying " + PATCH_FILE_NAME)) {
+            return true;
+        }
+        if (!unresolved.isEmpty()) {
+            for (File patchFile : unresolved) {
+                LOGGER.severe("Patch could not be applied even loosely: " + patchFile.getAbsolutePath());
+            }
             return false;
         }
-        retryApplyTask("after loosely applying build.gradle.kts.patch");
-        return true;
+        // 全部补丁都已宽松应用，但 Gradle apply 仍失败：后续 rebuild 会根据当前文件重新生成补丁
+        return applied > 0;
+    }
+
+    // 单个补丁的宽松应用结果
+    private enum ApplyOutcome {
+        APPLIED,
+        // 补丁头指向的文件在工作区里找不到（可能源码还未检出）
+        NOT_FOUND,
+        // 目标已定位但没有任何方式能把补丁应用上去
+        FAILED
+    }
+
+    // 递归收集仓库里的补丁文件与目标文件；skipDirs 用于跳过构建产物里的副本
+    private void walkFiles(File dir, int depth, Set<String> skipDirs, String fileName, List<File> out) {
+        if (depth < 0) {
+            return;
+        }
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        Arrays.sort(children, Comparator.comparing(File::getName));
+        for (File child : children) {
+            if (child.isDirectory()) {
+                if (child.getName().equals(".git") || (skipDirs != null && skipDirs.contains(child.getName()))) {
+                    continue;
+                }
+                walkFiles(child, depth - 1, skipDirs, fileName, out);
+            } else if (child.getName().equals(fileName)) {
+                out.add(child);
+            }
+        }
+    }
+
+    // 解析补丁头里的目标路径；保留原始形式，因为 -p 剥离的层数要按原始路径计算
+    private List<String> parsePatchHeaderPaths(File patchFile) throws IOException {
+        Set<String> paths = new LinkedHashSet<>();
+        for (String line : Files.readAllLines(patchFile.toPath(), StandardCharsets.UTF_8)) {
+            String raw;
+            if (line.startsWith("+++ ")) {
+                raw = line.substring(4);
+            } else if (line.startsWith("--- ")) {
+                raw = line.substring(4);
+            } else if (line.startsWith("diff --git ")) {
+                int marker = line.indexOf(" b/");
+                if (marker < 0) {
+                    continue;
+                }
+                raw = line.substring(marker + 3);
+            } else {
+                continue;
+            }
+            raw = raw.trim();
+            int tab = raw.indexOf('\t');
+            if (tab > 0) {
+                // 去掉 git 在时间戳形式头里附带的日期字段
+                raw = raw.substring(0, tab);
+            }
+            if (raw.isEmpty() || "/dev/null".equals(raw)) {
+                continue;
+            }
+            paths.add(raw);
+        }
+        return new ArrayList<>(paths);
+    }
+
+    // 去掉 a/ b/ 前缀，得到用于定位真实文件的路径
+    private static String normalizeHeaderPath(String headerPath) {
+        int slash = headerPath.indexOf('/');
+        if (slash > 0) {
+            String prefix = headerPath.substring(0, slash);
+            if (prefix.equals("a") || prefix.equals("b")) {
+                return headerPath.substring(slash + 1);
+            }
+        }
+        return headerPath;
+    }
+
+    // 定位补丁真正修改的文件：先按补丁头相对仓库根、相对补丁所在模块的路径查找，
+    // 再按文件名在仓库里搜索。补丁文件和它修改的文件不一定同级，
+    // 例如 lophine-server 里的 build.gradle.kts.patch 改的可能是 folia-server/build.gradle.kts。
+    private File locatePatchTarget(File patchFile, List<String> headerPaths) {
+        File moduleDir = patchFile.getParentFile();
+        List<String> normalized = new ArrayList<>();
+        for (String headerPath : headerPaths) {
+            String path = normalizeHeaderPath(headerPath);
+            if (!normalized.contains(path)) {
+                normalized.add(path);
+            }
+        }
+        for (String path : normalized) {
+            File direct = new File(repoDir, path);
+            if (direct.isFile()) {
+                return direct;
+            }
+            File inModule = new File(moduleDir, path);
+            if (inModule.isFile()) {
+                return inModule;
+            }
+        }
+        for (String path : normalized) {
+            File found = searchByFileName(path);
+            if (found != null) {
+                return found;
+            }
+        }
+        if (normalized.isEmpty() && patchFile.getName().endsWith(".patch")) {
+            File beside = new File(moduleDir, patchFile.getName().substring(0, patchFile.getName().length() - ".patch".length()));
+            if (beside.isFile()) {
+                return beside;
+            }
+        }
+        return null;
+    }
+
+    // 按文件名搜索：只有路径尾部与补丁头一致、或父目录名与补丁头一致时才采用，避免认错同名文件
+    private File searchByFileName(String headerPath) {
+        int lastSlash = headerPath.lastIndexOf('/');
+        String fileName = headerPath.substring(lastSlash + 1);
+        String headerParent = lastSlash < 0 ? "" : headerPath.substring(0, lastSlash);
+        List<File> matches = new ArrayList<>();
+        walkFiles(repoDir, MAX_SEARCH_DEPTH, null, fileName, matches);
+        for (File match : matches) {
+            String relative = toRepoRelative(match);
+            if (relative != null && (relative.equals(headerPath) || relative.endsWith("/" + headerPath))) {
+                return match;
+            }
+        }
+        if (!headerParent.isEmpty()) {
+            String parentName = headerParent.substring(headerParent.lastIndexOf('/') + 1);
+            for (File match : matches) {
+                File parent = match.getParentFile();
+                if (parent != null && parent.getName().equals(parentName)) {
+                    return match;
+                }
+            }
+        }
+        return null;
+    }
+
+    // 仓库外的路径无法用于 git apply / patch，直接当成找不到
+    private String toRepoRelative(File file) {
+        Path root = repoDir.toPath().toAbsolutePath().normalize();
+        Path path = file.toPath().toAbsolutePath().normalize();
+        if (!path.startsWith(root)) {
+            return null;
+        }
+        return root.relativize(path).toString().replace(File.separatorChar, '/');
     }
 
     private boolean retryApplyTask(String reason) throws IOException, InterruptedException {
@@ -289,86 +448,189 @@ public class UpstreamUpdater {
         return true;
     }
 
-    private boolean applyPatchLoosely(File dir, String patchName) throws IOException, InterruptedException {
-        File patchFile = new File(dir, patchName);
+    // 宽松应用单个补丁：先从补丁头解析出真正被修改的文件，再按 -p / --directory 的层级组合逐级降级尝试。
+    private ApplyOutcome applyPatchLoosely(File patchFile) throws IOException, InterruptedException {
         String patchPath = patchFile.getAbsolutePath();
-        File target = new File(dir, "build.gradle.kts");
-        if (!target.isFile()) {
-            LOGGER.warning("Skipping loose git apply for " + patchPath
-                    + ": no build.gradle.kts in " + dir.getAbsolutePath()
-                    + " (paperweight applies this patch during '" + applyTask + "')");
-            return false;
+        List<String> headerPaths = parsePatchHeaderPaths(patchFile);
+        File target = locatePatchTarget(patchFile, headerPaths);
+        if (target == null) {
+            LOGGER.warning("Cannot locate the file patched by " + patchPath
+                    + (headerPaths.isEmpty() ? "" : " (patch headers point at " + String.join(", ", headerPaths) + ")")
+                    + " under " + repoDir.getAbsolutePath());
+            return ApplyOutcome.NOT_FOUND;
         }
-        String module = dir.getName();
-        GitExecutor repoGit = new GitExecutor(repoDir);
 
-        // git apply 会从仓库根解析路径；在子目录里直接 apply 会打到错误位置。
-        // 降级顺序：丢掉上下文（-C0/--recount）→ 按模块目录偏移 → 三方合并。
-        String[][] attempts = {
-                {"apply", "--ignore-whitespace", "--recount", "-C0", "--directory=" + module, "-p1", patchPath},
-                {"apply", "--ignore-whitespace", "--recount", "-C0", "--directory=" + module, "-p0", patchPath},
-                {"apply", "--ignore-whitespace", "--recount", "-C0", "-p1", patchPath},
-                {"apply", "--ignore-whitespace", "--recount", "-C0", "-p0", patchPath},
-                {"apply", "--ignore-whitespace", "--unidiff-zero", "--directory=" + module, "-p1", patchPath},
-                {"apply", "--ignore-whitespace", "-p1", patchPath},
-                {"apply", "--ignore-whitespace", "--3way", "--directory=" + module, "-p1", patchPath},
-                {"apply", "--ignore-whitespace", "--3way", "-p1", patchPath}
+        String targetRel = toRepoRelative(target);
+        if (targetRel == null) {
+            LOGGER.warning("Patched file is outside the repository, skipping loose apply: " + target.getAbsolutePath());
+            return ApplyOutcome.NOT_FOUND;
+        }
+        LOGGER.info("Patch " + patchPath + " targets " + targetRel);
+
+        List<ApplyOption> options = buildApplyOptions(headerPaths, targetRel);
+        if (options.isEmpty()) {
+            LOGGER.warning("Patch headers " + String.join(", ", headerPaths)
+                    + " cannot be resolved to " + targetRel + ", skipping loose apply: " + patchPath);
+            return ApplyOutcome.FAILED;
+        }
+
+        GitExecutor repoGit = new GitExecutor(repoDir);
+        if (isAlreadyApplied(repoGit, options, patchPath)) {
+            return ApplyOutcome.APPLIED;
+        }
+
+        // git apply 会从仓库根解析路径，补丁头与目标文件的层级差靠 -p 和 --directory 补齐。
+        // 降级顺序：完整上下文 → 只丢掉行号计数 → 少上下文匹配 → 三方合并。
+        String[][] flagSets = {
+                {"--ignore-whitespace"},
+                {"--ignore-whitespace", "--recount"},
+                {"--ignore-whitespace", "--recount", "-C2"},
+                {"--ignore-whitespace", "--recount", "-C1"},
+                {"--ignore-whitespace", "--3way"}
         };
         Result last = null;
-        for (String[] attempt : attempts) {
-            last = repoGit.run(attempt);
-            if (last.isSuccess()) {
-                LOGGER.info("Patch applied successfully (" + String.join(" ", attempt) + "): " + patchPath);
-                return true;
+        for (ApplyOption option : options) {
+            for (String[] flags : flagSets) {
+                last = runGitApply(repoGit, flags, option, patchPath);
+                if (last.isSuccess()) {
+                    LOGGER.info("Patch applied successfully (" + describe(option) + " " + String.join(" ", flags)
+                            + "): " + patchPath);
+                    return ApplyOutcome.APPLIED;
+                }
             }
         }
-        if (applyWithPatchCommand(dir, patchName)) {
-            LOGGER.info("Patch applied with patch(1) fuzz: " + patchPath);
-            return true;
+        // patch(1) 的 fuzz 会按 hunk 行号就近搜索，比 git 完全丢掉上下文更容易落在正确位置
+        if (applyWithPatchCommand(patchFile, options)) {
+            return ApplyOutcome.APPLIED;
         }
-        // --reject 在部分 hunk 失败时仍返回 1；出现 reject 即视为降级成功
-        String[][] rejectAttempts = {
-                {"apply", "--ignore-whitespace", "--recount", "-C0", "--reject", "--directory=" + module, "-p1", patchPath},
-                {"apply", "--ignore-whitespace", "--recount", "-C0", "--reject", "-p1", patchPath},
-                {"apply", "--ignore-whitespace", "--recount", "-C0", "--reject", "-p0", patchPath}
+        // 最后只丢掉对不上的 hunk：能应用的先应用，剩下的交给 rebuild 重新生成，并留下 .rej 供人工确认
+        // -C0 单独使用会把补丁插到错误位置，只在 --reject 兼容不了上下文时作为最后选项
+        String[][] rejectFlagSets = {
+                {"--ignore-whitespace", "--recount", "--reject"},
+                {"--ignore-whitespace", "--recount", "-C2", "--reject"},
+                {"--ignore-whitespace", "--recount", "-C0", "--reject"}
         };
-        for (String[] attempt : rejectAttempts) {
-            last = repoGit.run(attempt);
-            if (last.isSuccess() || isPartialRejectApply(last)) {
-                LOGGER.warning("Patch applied loosely (some hunks may be rejected): " + patchPath);
-                return true;
+        for (String[] flags : rejectFlagSets) {
+            for (ApplyOption option : options) {
+                int before = contentFingerprint(target);
+                last = runGitApply(repoGit, flags, option, patchPath);
+                if (last.isSuccess() || (isPartialRejectApply(last) && contentFingerprint(target) != before)) {
+                    LOGGER.warning("Patch applied with rejects, check the .rej files: " + patchPath);
+                    return ApplyOutcome.APPLIED;
+                }
             }
         }
         LOGGER.severe("Failed to apply patch even loosely: " + patchPath
                 + (last == null ? "" : ": " + firstNonBlank(last.stderr(), last.stdout())));
+        return ApplyOutcome.FAILED;
+    }
+
+    // 用于判断 --reject 是否真的写入了内容（全部 hunk 被拒时也会生成 .rej）
+    private static int contentFingerprint(File file) {
+        try {
+            return Arrays.hashCode(Files.readAllBytes(file.toPath()));
+        } catch (IOException e) {
+            return 0;
+        }
+    }
+
+    // 一次路径解析组合：从补丁头剥离几层前缀、在哪个目录下解析剩下的路径
+    private record ApplyOption(int strip, String directory) {
+    }
+
+    // 按 git -p 的语义枚举能把补丁头映射到目标文件的组合：剩下几层路径就作为 --directory 前缀，
+    // 这样即使目标文件在缓存目录里比补丁头多几层也能打到正确位置
+    private List<ApplyOption> buildApplyOptions(List<String> headerPaths, String targetRel) {
+        List<ApplyOption> options = new ArrayList<>();
+        for (String headerPath : headerPaths) {
+            String[] parts = headerPath.split("/");
+            for (int strip = 0; strip < parts.length; strip++) {
+                String stripped = String.join("/", Arrays.copyOfRange(parts, strip, parts.length));
+                ApplyOption option;
+                if (stripped.equals(targetRel)) {
+                    option = new ApplyOption(strip, "");
+                } else if (targetRel.endsWith("/" + stripped)) {
+                    option = new ApplyOption(strip, targetRel.substring(0, targetRel.length() - stripped.length() - 1));
+                } else {
+                    continue;
+                }
+                if (!options.contains(option)) {
+                    options.add(option);
+                }
+            }
+        }
+        // 能直接按仓库根解析的组合更可靠，排在前面
+        options.sort(Comparator.comparingInt(candidate -> candidate.directory().isEmpty() ? 0 : 1));
+        return options;
+    }
+
+    private Result runGitApply(GitExecutor repoGit, String[] flags, ApplyOption option, String patchPath)
+            throws IOException, InterruptedException {
+        List<String> args = new ArrayList<>();
+        args.add("apply");
+        Collections.addAll(args, flags);
+        if (!option.directory().isEmpty()) {
+            args.add("--directory=" + option.directory());
+        }
+        args.add("-p" + option.strip());
+        args.add(patchPath);
+        return repoGit.run(args.toArray(new String[0]));
+    }
+
+    // 上游已经带有相同改动时补丁会重复命中，这种情况无需再应用
+    private boolean isAlreadyApplied(GitExecutor repoGit, List<ApplyOption> options, String patchPath)
+            throws IOException, InterruptedException {
+        for (ApplyOption option : options) {
+            Result result = runGitApply(repoGit, new String[]{"--reverse", "--check"}, option, patchPath);
+            if (result.isSuccess()) {
+                LOGGER.info("Patch already applied, nothing to do: " + patchPath);
+                return true;
+            }
+        }
         return false;
     }
 
-    private boolean applyWithPatchCommand(File dir, String patchName) throws IOException, InterruptedException {
-        for (String strip : new String[]{"-p1", "-p0", "-p2"}) {
-            List<String> command = new ArrayList<>();
-            command.add("patch");
-            command.add(strip);
-            command.add("-N");
-            command.add("-l");
-            command.add("--fuzz=3");
-            command.add("--no-backup-if-mismatch");
-            command.add("-i");
-            command.add(patchName);
-            ProcessBuilder builder = new ProcessBuilder(command);
-            builder.directory(dir);
-            builder.redirectErrorStream(true);
-            try {
-                Process process = builder.start();
-                String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-                int exitCode = process.waitFor();
-                if (exitCode == 0) {
-                    return true;
+    private static String describe(ApplyOption option) {
+        return "-p" + option.strip() + (option.directory().isEmpty() ? "" : " --directory=" + option.directory());
+    }
+
+    // patch(1) 逐级放宽 fuzz（允许忽略的外围上下文行数），只在 git apply 全部失败后使用
+    private boolean applyWithPatchCommand(File patchFile, List<ApplyOption> options) {
+        String patchPath = patchFile.getAbsolutePath();
+        for (ApplyOption option : options) {
+            File dir = option.directory().isEmpty() ? repoDir : new File(repoDir, option.directory());
+            for (int fuzz = 0; fuzz <= 3; fuzz++) {
+                List<String> command = new ArrayList<>();
+                command.add("patch");
+                command.add("-p" + option.strip());
+                command.add("-N");
+                command.add("-l");
+                command.add("--fuzz=" + fuzz);
+                command.add("--no-backup-if-mismatch");
+                command.add("-i");
+                command.add(patchPath);
+                ProcessBuilder builder = new ProcessBuilder(command);
+                builder.directory(dir);
+                builder.redirectErrorStream(true);
+                try {
+                    Process process = builder.start();
+                    String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                    int exitCode = process.waitFor();
+                    if (exitCode == 0) {
+                        LOGGER.info("Patch applied with patch(1) " + describe(option) + " --fuzz=" + fuzz + ": " + patchPath);
+                        return true;
+                    }
+                    if (fuzz == 3) {
+                        LOGGER.warning("patch(1) " + describe(option) + " failed for " + patchPath
+                                + " (exit " + exitCode + "): " + output);
+                    }
+                } catch (IOException e) {
+                    LOGGER.warning("patch(1) is not available: " + e.getMessage());
+                    return false;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
                 }
-                LOGGER.warning("patch(1) " + strip + " failed for " + patchName + " (exit " + exitCode + "): " + output);
-            } catch (IOException e) {
-                LOGGER.warning("patch(1) is not available: " + e.getMessage());
-                return false;
             }
         }
         return false;

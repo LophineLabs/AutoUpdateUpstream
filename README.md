@@ -298,14 +298,20 @@ Patch 型 Fork 在更新上游时，可能因为上游代码变化导致已有 P
 
 `AutoUpdateUpstream` 对 `build.gradle.kts.patch` 提供了一套兼容性回退处理。
 
-当普通 Patch 应用失败时，程序可以尝试：
+当普通 Patch 应用失败时，程序会：
 
-- 查找直接子目录中的 `build.gradle.kts.patch`
-- 将已知不兼容的 `_,` 改写为 `1,`
-- 立刻重新执行原来的 Gradle apply 任务（Paperweight 会读取改写后的补丁）
-- 仍失败时再降级应用：降低上下文（`-C0` / `--recount`）、`patch --fuzz`、三方合并
-- 按模块目录偏移路径，避免在子目录里 `git apply` 打到仓库根
-- 最后尝试使用 `--reject` 方式宽松应用；部分 hunk 被拒绝时仍视为降级成功
+- 递归查找仓库中的 `build.gradle.kts.patch`（跳过 `.git`、`.gradle`、`build`）
+- 将已知不兼容的 `_,` 改写为 `1,`，并立刻重新执行原来的 Gradle apply 任务（Paperweight 会读取改写后的补丁）
+- 从补丁头（`---`/`+++`/`diff --git`）解析出真正被修改的文件，再定位它
+- 按目标文件在仓库里的实际位置推导 `-p` 层数和 `--directory`，避免打到错误位置
+- 逐级降级应用：完整上下文 → `--recount` → 少上下文（`-C2` / `-C1`）→ 三方合并 → `patch --fuzz`
+- 最后用 `--reject` 只丢掉对不上的 hunk；只要目标文件确实被改动就视为降级成功，并保留 `.rej` 供人工确认
+- 上游已经带上同样改动时识别为“已应用”，不重复插入
+
+单文件补丁修改的文件常常不在补丁所在的模块，例如 `lophine-server/build.gradle.kts.patch`
+改的是 `folia-server/build.gradle.kts`，这类情况现在也能处理。
+若补丁指向的文件在工作区里还不存在（上游源码尚未检出），程序不会因此判定失败，
+而是交给重试的 Gradle apply 任务处理。
 
 这些逻辑主要用于提高上游升级时的自动兼容能力。
 
